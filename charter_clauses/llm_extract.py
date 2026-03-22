@@ -7,7 +7,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from openai import OpenAI
+from openai import LengthFinishReasonError, OpenAI
 
 from charter_clauses.models import Clause, ClauseExtractionResult
 
@@ -45,6 +45,12 @@ the full clause text visible in this chunk only — the application will merge c
 
 {text}"""
 
+CHUNK_SYSTEM_EXTRA = (
+    "You may receive only a portion of Part II. Extract every clause that appears in this "
+    "portion, in order. If a clause is cut off at a chunk boundary, include the visible text "
+    "under that clause id; later chunks may continue the same id and will be merged."
+)
+
 
 def _client() -> OpenAI:
     api_key = os.getenv("OPENAI_API_KEY")
@@ -68,24 +74,119 @@ def _parse_clause_json(data: str) -> ClauseExtractionResult:
     return ClauseExtractionResult.model_validate_json(data)
 
 
-def extract_clauses_openai(part2_text: str) -> list[Clause]:
-    """Single request with structured output (OpenAI parse API)."""
-    client = _client()
-    model = _model_name()
+def _merge_chunk_clauses(chunks: list[list[Clause]]) -> list[Clause]:
+    """Merge clause lists from overlapping chunks; stitch same id at boundaries."""
+    flat: list[Clause] = []
+    for batch in chunks:
+        flat.extend(batch)
+    if not flat:
+        return []
+    out: list[Clause] = [flat[0]]
+    for c in flat[1:]:
+        prev = out[-1]
+        if c.id == prev.id:
+            if c.text not in prev.text:
+                out[-1] = Clause(
+                    id=prev.id,
+                    title=prev.title if len(prev.title) >= len(c.title) else c.title,
+                    text=prev.text + "\n\n" + c.text,
+                )
+            continue
+        out.append(c)
+    return out
 
-    user_content = (
-        "Extract all clauses from the following Part II text.\n\n---\n\n" + part2_text
+
+def _split_paragraph_chunks(text: str, max_chars: int, overlap: int) -> list[str]:
+    """Split long text at paragraph boundaries with overlap."""
+    if len(text) <= max_chars:
+        return [text]
+    chunks: list[str] = []
+    start = 0
+    n = len(text)
+    while start < n:
+        end = min(start + max_chars, n)
+        if end < n:
+            window = text[start:end]
+            cut = window.rfind("\n\n")
+            if cut > max_chars // 3:
+                end = start + cut
+        piece = text[start:end].strip()
+        if piece:
+            chunks.append(piece)
+        if end >= n:
+            break
+        start = max(0, end - overlap)
+    return chunks
+
+
+def _openai_parse_chunk(
+    client: OpenAI, model: str, chunk: str, idx: int, total: int
+) -> list[Clause]:
+    system = SYSTEM_PROMPT + "\n\n" + CHUNK_SYSTEM_EXTRA
+    user = (
+        f"(Part {idx + 1} of {total})\n\n"
+        + CHUNK_USER_WRAPPER.format(text=chunk)
     )
-
     completion = client.beta.chat.completions.parse(
         model=model,
         temperature=0,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
         ],
         response_format=ClauseExtractionResult,
     )
+    msg = completion.choices[0].message
+    if msg.refusal:
+        raise RuntimeError(f"Model refused: {msg.refusal}")
+    parsed = msg.parsed
+    if not parsed:
+        raise RuntimeError("No parsed result from model")
+    return parsed.clauses
+
+
+def _extract_clauses_openai_chunked(part2_text: str) -> list[Clause]:
+    """Multiple parse calls to avoid output token truncation on long Part II."""
+    client = _client()
+    model = _model_name()
+    page_secs = _page_sections(part2_text)
+    if len(page_secs) > 1:
+        chunk_size = int(os.getenv("OPENAI_CHUNK_PAGES", "5"))
+        overlap = int(os.getenv("OPENAI_CHUNK_PAGE_OVERLAP", "2"))
+        text_chunks = _chunk_page_sections(page_secs, chunk_size, overlap)
+    else:
+        max_c = int(os.getenv("OPENAI_CHUNK_CHARS", "12000"))
+        ov = int(os.getenv("OPENAI_CHUNK_CHAR_OVERLAP", "4000"))
+        text_chunks = _split_paragraph_chunks(part2_text, max_c, ov)
+
+    results: list[list[Clause]] = []
+    for i, ch in enumerate(text_chunks):
+        results.append(_openai_parse_chunk(client, model, ch, i, len(text_chunks)))
+    return _merge_chunk_clauses(results)
+
+
+def extract_clauses_openai(part2_text: str) -> list[Clause]:
+    """Structured output via parse API; chunks automatically when the document is long."""
+    min_chars_for_chunk = int(os.getenv("OPENAI_CHUNK_MIN_CHARS", "45000"))
+    if len(part2_text) >= min_chars_for_chunk:
+        return _extract_clauses_openai_chunked(part2_text)
+    client = _client()
+    model = _model_name()
+    user_content = (
+        "Extract all clauses from the following Part II text.\n\n---\n\n" + part2_text
+    )
+    try:
+        completion = client.beta.chat.completions.parse(
+            model=model,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            response_format=ClauseExtractionResult,
+        )
+    except LengthFinishReasonError:
+        return _extract_clauses_openai_chunked(part2_text)
     msg = completion.choices[0].message
     if msg.refusal:
         raise RuntimeError(f"Model refused: {msg.refusal}")
