@@ -32,6 +32,7 @@ Options:
 
 - `--first-page` / `--last-page` — default to Part II pages **6–39** for this sample PDF.
 - `--page-markers` — inserts `--- Page N ---` markers; use with `OLLAMA_CHUNK=1` for chunked local runs.
+- `--no-dedupe-by-id` — by default, clause rows with the same `id` (from overlapping chunks) are merged into one entry; disable for raw model output.
 
 ### Local LLM (Ollama)
 

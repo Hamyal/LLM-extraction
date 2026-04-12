@@ -53,11 +53,12 @@ CHUNK_SYSTEM_EXTRA = (
 
 
 def _client() -> OpenAI:
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError(
-            "OPENAI_API_KEY is not set. Copy .env.example to .env and add your key, "
-            "or export the variable in your shell."
+            "OPENAI_API_KEY is missing or empty. Put your key on the same line as "
+            "OPENAI_API_KEY= in .env, save the file (Ctrl+S), and run again — or export "
+            "OPENAI_API_KEY in your shell."
         )
     base_url = os.getenv("OPENAI_BASE_URL")
     kwargs: dict[str, Any] = {"api_key": api_key}
@@ -72,6 +73,46 @@ def _model_name() -> str:
 
 def _parse_clause_json(data: str) -> ClauseExtractionResult:
     return ClauseExtractionResult.model_validate_json(data)
+
+
+def _merge_clause_texts(a: str, b: str) -> str:
+    """Join two text blobs; avoid duplication when one is a substring of the other."""
+    a, b = a.strip(), b.strip()
+    if not b:
+        return a
+    if not a:
+        return b
+    if b in a:
+        return a
+    if a in b:
+        return b
+    return a + "\n\n" + b
+
+
+def dedupe_clauses_by_id(clauses: list[Clause]) -> list[Clause]:
+    """
+    Collapse repeated clause ids (e.g. from overlapping LLM chunks) while keeping
+    first-seen order. Distinct ids such as '4' vs '4-Rider' remain separate.
+    """
+    if not clauses:
+        return []
+    order: list[str] = []
+    merged: dict[str, Clause] = {}
+    for c in clauses:
+        key = c.id.strip()
+        if key not in merged:
+            order.append(key)
+            merged[key] = Clause(
+                id=c.id.strip(),
+                title=c.title.strip(),
+                text=c.text.strip(),
+            )
+        else:
+            prev = merged[key]
+            title = prev.title if len(prev.title) >= len(c.title) else c.title.strip()
+            text = _merge_clause_texts(prev.text, c.text)
+            merged[key] = Clause(id=prev.id, title=title, text=text)
+    return [merged[k] for k in order]
 
 
 def _merge_chunk_clauses(chunks: list[list[Clause]]) -> list[Clause]:
@@ -293,12 +334,16 @@ def extract_clauses_ollama(
     return out
 
 
-def extract_clauses_llm(part2_text: str) -> list[Clause]:
+def extract_clauses_llm(part2_text: str, *, dedupe_by_id: bool = True) -> list[Clause]:
     """Dispatch by CHARTER_LLM_PROVIDER: openai (default) or ollama."""
     provider = os.getenv("CHARTER_LLM_PROVIDER", "openai").lower().strip()
     if provider == "ollama":
-        return extract_clauses_ollama(part2_text)
-    return extract_clauses_openai(part2_text)
+        clauses = extract_clauses_ollama(part2_text)
+    else:
+        clauses = extract_clauses_openai(part2_text)
+    if dedupe_by_id:
+        clauses = dedupe_clauses_by_id(clauses)
+    return clauses
 
 
 def clauses_to_jsonable(clauses: list[Clause]) -> list[dict[str, str]]:

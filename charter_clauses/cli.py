@@ -14,6 +14,9 @@ from charter_clauses.pdf_extract import (
     extract_part2_text,
 )
 
+# Project root (parent of `charter_clauses/`) so `.env` loads regardless of cwd.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -53,13 +56,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not load a .env file",
     )
+    p.add_argument(
+        "--no-dedupe-by-id",
+        action="store_true",
+        help="Disable merging duplicate clause ids (default: merge overlapping chunk duplicates).",
+    )
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if not args.no_env_file:
-        load_dotenv()
+        load_dotenv(_PROJECT_ROOT / ".env")
 
     pdf = Path(args.pdf)
     if not pdf.is_file():
@@ -73,7 +81,7 @@ def main(argv: list[str] | None = None) -> int:
         page_markers=args.page_markers,
     )
     try:
-        clauses = extract_clauses_llm(part2)
+        clauses = extract_clauses_llm(part2, dedupe_by_id=not args.no_dedupe_by_id)
     except RuntimeError as e:
         print(str(e), file=sys.stderr)
         return 2
